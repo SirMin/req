@@ -163,7 +163,7 @@ func Do(method, rawurl string, v ...interface{}) (r *Req, err error) {
 		req.Header.Set("Content-Type", bodyWriter.FormDataContentType())
 		req.Body = ioutil.NopCloser(pr)
 	} else if len(param) > 0 {
-		var params url.Values
+		params := make(url.Values)
 		for _, p := range param {
 			for key, value := range p {
 				params.Add(key, value)
