@@ -17,26 +17,36 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
+// http request header param
 type Header map[string]string
+
+// http request param
 type Param map[string]string
-type File struct {
-	Filename string
-	Formname string
-	Source   io.Reader
+
+// represents a file to upload
+type FileUpload struct {
+	// filename in multipart form.
+	FileName string
+	// form field name
+	FieldName string
+	// file to uplaod, required
+	File io.ReadCloser
 }
 
+// custom http client
 var Client *http.Client
+
 var defaultClient *http.Client
-var defaultTransport *http.Transport
 var regTextContentType = regexp.MustCompile("xml|json|text")
 
 func init() {
 	jar, _ := cookiejar.New(nil)
-	defaultTransport = &http.Transport{
+	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -50,11 +60,12 @@ func init() {
 	}
 	defaultClient = &http.Client{
 		Jar:       jar,
-		Transport: defaultTransport,
+		Transport: transport,
 		Timeout:   2 * time.Minute,
 	}
 }
 
+// Req represents a request with it's response
 type Req struct {
 	req      *http.Request
 	resp     *http.Response
@@ -63,13 +74,31 @@ type Req struct {
 	respBody []byte
 }
 
-func EnableInsecureTLS(enable bool) {
-	if defaultTransport.TLSClientConfig == nil {
-		defaultTransport.TLSClientConfig = &tls.Config{}
+func getClient() *http.Client {
+	if Client != nil {
+		return Client
 	}
-	defaultTransport.TLSClientConfig.InsecureSkipVerify = enable
+	return defaultClient
 }
 
+func getTransport() *http.Transport {
+	trans, _ := getClient().Transport.(*http.Transport)
+	return trans
+}
+
+// EnableInsecureTLS
+func EnableInsecureTLS(enable bool) {
+	trans := getTransport()
+	if trans == nil {
+		return
+	}
+	if trans.TLSClientConfig == nil {
+		trans.TLSClientConfig = &tls.Config{}
+	}
+	trans.TLSClientConfig.InsecureSkipVerify = enable
+}
+
+// Do execute request.
 func Do(method, rawurl string, v ...interface{}) (r *Req, err error) {
 	if rawurl == "" {
 		return nil, errors.New("req: url not specified")
@@ -82,22 +111,28 @@ func Do(method, rawurl string, v ...interface{}) (r *Req, err error) {
 		ProtoMinor: 1,
 	}
 	r = &Req{req: req}
-	handleBody := func(body *Body) {
-		if body == nil {
+	handleBody := func(b *body) {
+		if b == nil {
 			return
 		}
-		req.Body = body.readCloser
-		if body.contentType != "" && req.Header.Get("Content-Type") == "" {
-			req.Header.Set("Content-Type", body.contentType)
+		if b.Content == nil {
+			if b.Data == nil {
+				return
+			}
+			b.Content = ioutil.NopCloser(bytes.NewReader(b.Data))
 		}
-		if body.bytes != nil {
-			r.reqBody = body.bytes
-			req.ContentLength = int64(len(body.bytes))
+		req.Body = b.Content
+		if b.ContentType != "" && req.Header.Get("Content-Type") == "" {
+			req.Header.Set("Content-Type", b.ContentType)
+		}
+		if b.Data != nil {
+			r.reqBody = b.Data
+			req.ContentLength = int64(len(b.Data))
 		}
 	}
 
 	var param []Param
-	var file []File
+	var file []FileUpload
 	for _, p := range v {
 		switch t := p.(type) {
 		case Header:
@@ -106,18 +141,32 @@ func Do(method, rawurl string, v ...interface{}) (r *Req, err error) {
 			}
 		case http.Header:
 			req.Header = t
-		case io.ReadCloser:
-			req.Body = t
 		case io.Reader:
-			req.Body = ioutil.NopCloser(t)
-		case *Body:
+			if rc, ok := t.(io.ReadCloser); ok {
+				req.Body = rc
+			} else {
+				req.Body = ioutil.NopCloser(t)
+			}
+		case *body:
 			handleBody(t)
 		case Param:
 			param = append(param, t)
+		case string:
+			handleBody(&body{Content: ioutil.NopCloser(strings.NewReader(t)), Data: []byte(t)})
+		case []byte:
+			handleBody(&body{Content: ioutil.NopCloser(bytes.NewReader(t)), Data: t})
 		case *http.Client:
 			r.client = t
-		case File:
+		case FileUpload:
 			file = append(file, t)
+		case []FileUpload:
+			if file == nil {
+				file = make([]FileUpload, len(t))
+			}
+			copy(file, t)
+		case error:
+			err = t
+			return
 		}
 	}
 
@@ -125,32 +174,24 @@ func Do(method, rawurl string, v ...interface{}) (r *Req, err error) {
 		pr, pw := io.Pipe()
 		bodyWriter := multipart.NewWriter(pw)
 		go func() {
+			i := 0
 			for _, f := range file {
-				fileWriter, e := bodyWriter.CreateFormFile(f.Formname, filepath.Base(f.Filename))
+				if f.FieldName == "" {
+					i++
+					f.FieldName = "file" + strconv.Itoa(i)
+				}
+				fileWriter, e := bodyWriter.CreateFormFile(f.FieldName, f.FileName)
 				if e != nil {
 					err = e
 					return
 				}
 				//iocopy
-				var src io.Reader
-				if f.Source == nil {
-					src, e = os.Open(f.Filename)
-					if e != nil {
-						err = e
-						return
-					}
-				} else {
-					src = f.Source
-				}
-				_, e = io.Copy(fileWriter, src)
+				_, e = io.Copy(fileWriter, f.File)
 				if e != nil {
 					err = e
 					return
 				}
-
-				if closer, ok := src.(io.Closer); ok {
-					closer.Close()
-				}
+				f.File.Close()
 			}
 			for _, p := range param {
 				for key, value := range p {
@@ -177,10 +218,10 @@ func Do(method, rawurl string, v ...interface{}) (r *Req, err error) {
 				rawurl = rawurl + "&" + paramStr
 			}
 		} else {
-			body := &Body{
-				contentType: "application/x-www-form-urlencoded",
-				bytes:       []byte(paramStr),
-				readCloser:  ioutil.NopCloser(strings.NewReader(paramStr)),
+			body := &body{
+				ContentType: "application/x-www-form-urlencoded",
+				Data:        []byte(paramStr),
+				Content:     ioutil.NopCloser(strings.NewReader(paramStr)),
 			}
 			handleBody(body)
 		}
@@ -216,79 +257,130 @@ func Do(method, rawurl string, v ...interface{}) (r *Req, err error) {
 		}
 		r.respBody = respBody
 	}
-	return r, nil
+	return
 }
 
-type Body struct {
-	contentType string
-	bytes       []byte
-	readCloser  io.ReadCloser
+// Body represents request's body
+type body struct {
+	ContentType string
+	Content     io.ReadCloser
+	Data        []byte
 }
 
-func BodyXML(b interface{}) *Body {
-	body := new(Body)
-	switch v := b.(type) {
+// BodyXML get request's body as xml
+func BodyXML(v interface{}) interface{} {
+	b := new(body)
+	switch t := v.(type) {
 	case string:
-		bf := bytes.NewBufferString(v)
-		body.readCloser = ioutil.NopCloser(bf)
-		body.bytes = []byte(v)
+		bf := bytes.NewBufferString(t)
+		b.Content = ioutil.NopCloser(bf)
+		b.Data = []byte(t)
 	case []byte:
-		bf := bytes.NewBuffer(v)
-		body.readCloser = ioutil.NopCloser(bf)
-		body.bytes = v
+		bf := bytes.NewBuffer(t)
+		b.Content = ioutil.NopCloser(bf)
+		b.Data = t
 	default:
-		bs, err := xml.Marshal(body)
+		bs, err := xml.Marshal(v)
 		if err != nil {
-			return nil
+			return err
 		}
 		bf := bytes.NewBuffer(bs)
-		body.readCloser = ioutil.NopCloser(bf)
-		body.bytes = bs
+		b.Content = ioutil.NopCloser(bf)
+		b.Data = bs
 	}
-	body.contentType = "text/xml"
-	return body
+	b.ContentType = "text/xml"
+	return b
 }
 
-func BodyJSON(b interface{}) *Body {
-	body := new(Body)
-	switch v := b.(type) {
+// BodyJSON get request's body as json
+func BodyJSON(v interface{}) interface{} {
+	b := new(body)
+	switch t := v.(type) {
 	case string:
-		bf := bytes.NewBufferString(v)
-		body.readCloser = ioutil.NopCloser(bf)
-		body.bytes = []byte(v)
+		bf := bytes.NewBufferString(t)
+		b.Content = ioutil.NopCloser(bf)
+		b.Data = []byte(t)
 	case []byte:
-		bf := bytes.NewBuffer(v)
-		body.readCloser = ioutil.NopCloser(bf)
-		body.bytes = v
+		bf := bytes.NewBuffer(t)
+		b.Content = ioutil.NopCloser(bf)
+		b.Data = t
 	default:
-		bs, err := json.Marshal(body)
+		bs, err := json.Marshal(v)
 		if err != nil {
-			return nil
+			return err
 		}
 		bf := bytes.NewBuffer(bs)
-		body.readCloser = ioutil.NopCloser(bf)
-		body.bytes = bs
+		b.Content = ioutil.NopCloser(bf)
+		b.Data = bs
 	}
-	body.contentType = "text/json"
-	return body
+	b.ContentType = "text/json"
+	return b
 }
 
+// File upload file of the specified filename.
+func File(filename string) interface{} {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	return FileUpload{
+		File:     file,
+		FileName: filepath.Base(filename),
+	}
+}
+
+// FileGlob upload files matching the name pattern such as
+// /usr/*/bin/go* (assuming the Separator is '/')
+func FileGlob(pattern string) interface{} {
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return err
+	}
+	if len(matches) == 0 {
+		return errors.New("req: No files have been matched")
+	}
+	uploads := []FileUpload{}
+	for _, match := range matches {
+		if s, e := os.Stat(match); e != nil || s.IsDir() {
+			continue
+		}
+		file, _ := os.Open(match)
+		uploads = append(uploads, FileUpload{File: file, FileName: filepath.Base(match)})
+	}
+	return uploads
+}
+
+// Request returns *http.Request
+func (r *Req) Request() *http.Request {
+	return r.req
+}
+
+// Response returns *http.Response
+func (r *Req) Response() *http.Response {
+	return r.resp
+}
+
+// Bytes returns response body as []byte
 func (r *Req) Bytes() []byte {
 	return r.respBody
 }
 
+// String returns response body as string
 func (r *Req) String() string {
 	return string(r.respBody)
 }
 
+// ToJSON convert json response body to struct or map
 func (r *Req) ToJSON(v interface{}) error {
 	return json.Unmarshal(r.respBody, v)
 }
 
+// ToXML convert xml response body to struct or map
 func (r *Req) ToXML(v interface{}) error {
 	return xml.Unmarshal(r.respBody, v)
 }
 
+// ToFile download the response body to file
 func (r *Req) ToFile(name string) error {
 	file, err := os.Create(name)
 	if err != nil {
@@ -365,9 +457,37 @@ func (r *Req) Format(s fmt.State, verb rune) {
 
 }
 
+// Get execute a http GET request
 func Get(url string, v ...interface{}) (*Req, error) {
 	return Do("GET", url, v...)
 }
+
+// Post execute a http POST request
 func Post(url string, v ...interface{}) (*Req, error) {
 	return Do("POST", url, v...)
+}
+
+// Put execute a http PUT request
+func Put(url string, v ...interface{}) (*Req, error) {
+	return Do("PUT", url, v...)
+}
+
+// Patch execute a http PATCH request
+func Patch(url string, v ...interface{}) (*Req, error) {
+	return Do("PATCH", url, v...)
+}
+
+// Delete execute a http DELETE request
+func Delete(url string, v ...interface{}) (*Req, error) {
+	return Do("DELETE", url, v...)
+}
+
+// Head execute a http HEAD request
+func Head(url string, v ...interface{}) (*Req, error) {
+	return Do("HEAD", url, v...)
+}
+
+// Options execute a http OPTIONS request
+func Options(url string, v ...interface{}) (*Req, error) {
+	return Do("OPTIONS", url, v...)
 }
