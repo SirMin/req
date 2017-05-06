@@ -35,12 +35,11 @@ Examples
 [Basic](#Basic)  
 [Set Header](#Set-Header)  
 [Set Param](#Set-Param)  
-[Set Body](#Set-Body)
-[Debug / Logging](#Debug-Logging)
-[ToJSON / ToXML](#ToJSON-ToXML)
-[Upload](#Upload)
-[Download](#Download)
-
+[Set Body](#Set-Body)  
+[Debug / Logging](#Debug-Logging)  
+[ToJSON / ToXML](#ToJSON-ToXML)  
+[Upload](#Upload)  
+[Download](#Download)  
 
 ## <a name="Basic">Basic</a>
 ``` go
